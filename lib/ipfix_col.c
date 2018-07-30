@@ -39,6 +39,7 @@ $$LIC$$
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 
 #include "mlog.h"
 #include "mpoll.h"
@@ -127,11 +128,13 @@ sctp_assoc_node_t *sctp_assocs = NULL;               /* sctp associations */
 
 /*----- prototypes -------------------------------------------------------*/
 
-static ipfixt_node_t *_get_ipfixt( ipfixt_node_t *tlist, int tid );
+static ipfixt_node_t *_get_ipfixt( ipfixt_node_t *tlist, int tid, int sourceid );
 static ipfixs_node_t *_get_ipfix_source( ipfixs_node_t **slist,
                                          ipfix_input_t *input, uint32_t odid );
 static void _delete_ipfixt( ipfixt_node_t **tlist, ipfixt_node_t *node );
 void _delete_ipfix_source( ipfixs_node_t **slist, ipfixs_node_t *node );
+
+static pthread_mutex_t ipfix_sources_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*----- static funcs -----------------------------------------------------*/
 
@@ -139,11 +142,11 @@ void _delete_ipfix_source( ipfixs_node_t **slist, ipfixs_node_t *node );
  * name:        _get_ipfixt
  * remarks:     template management
  */
-static ipfixt_node_t *_get_ipfixt( ipfixt_node_t *tlist, int tid )
+static ipfixt_node_t *_get_ipfixt( ipfixt_node_t *tlist, int tid, int odid )
 {
     while ( tlist )
     {
-        if ( tlist->ipfixt->tid == tid )
+        if ( tlist->ipfixt->tid == tid && tlist->ipfixt->odid == odid )
             return tlist;
 
         tlist = tlist->next;
@@ -410,8 +413,10 @@ static ipfixs_node_t *_get_ipfix_source( ipfixs_node_t **slist,
 
     /** insert node
      */
+    pthread_mutex_lock( &ipfix_sources_mutex );
     s->next = *slist;
     *slist  = s;
+    pthread_mutex_unlock( &ipfix_sources_mutex );
     return s;
 }
 
@@ -423,22 +428,27 @@ void _delete_ipfix_source( ipfixs_node_t **slist, ipfixs_node_t *node )
         return;
     }
     else if ( n==node ) {
+        pthread_mutex_lock( &ipfix_sources_mutex );
         *slist = node->next;
+        pthread_mutex_unlock( &ipfix_sources_mutex );
         goto freenode;
     }
     else {
         last = n;
     }
 
+    pthread_mutex_lock( &ipfix_sources_mutex );
     while ( n ) {
         if ( n == node ) {
             last->next = node->next;
+            pthread_mutex_unlock( &ipfix_sources_mutex );
             goto freenode;
         }
 
         last = n;
         n    = n->next;
     }
+    pthread_mutex_unlock( &ipfix_sources_mutex );
 
     mlogf( 1, "[delete_ipfixs] node %u not found!\n", (u_int)node->odid ); 
 
@@ -676,16 +686,20 @@ int ipfix_decode_trecord( ipfixs_node_t  *s,
         /** template withdrawal message
          */
         if ( templid == setid ) {
+            pthread_mutex_lock( &ipfix_sources_mutex );
             while( s->templates )
                 _delete_ipfixt( &(s->templates), s->templates );
+            pthread_mutex_unlock( &ipfix_sources_mutex );
             mlogf( 3, "[%s] %u withdraw all templates\n",
                    func, (u_int)s->odid ); 
         }
-        else if ( (n=_get_ipfixt( s->templates, templid )) == NULL) {
+        else if ( (n=_get_ipfixt( s->templates, templid, s->odid )) == NULL) {
             mlogf( 3, "[%s] %u got withdraw for non-existant template %d\n", 
                    func, (u_int)s->odid, templid ); 
         } else {
+            pthread_mutex_lock( &ipfix_sources_mutex );
             _delete_ipfixt( &(s->templates), n );
+            pthread_mutex_unlock( &ipfix_sources_mutex );
             mlogf( 3, "[%s] %u withdraw template %u\n", 
                    func, (u_int)s->odid, templid ); 
         }
@@ -703,24 +717,30 @@ int ipfix_decode_trecord( ipfixs_node_t  *s,
 
     /** get template node
      */
-    if ( ((n=_get_ipfixt( s->templates, templid )) == NULL)
+    pthread_mutex_lock( &ipfix_sources_mutex );
+    if ( ((n=_get_ipfixt( s->templates, templid, s->odid )) == NULL)
          || (nfields > n->ipfixt->nfields) ) {
 
-        if ( n )
+        if ( n ) {
             _delete_ipfixt( &(s->templates), n );
+        }
 
         /** alloc mem
          */
-        if ( (t=calloc( 1, sizeof(ipfix_template_t) )) ==NULL )
+        if ( (t=calloc( 1, sizeof(ipfix_template_t) )) ==NULL ) {
+            pthread_mutex_unlock( &ipfix_sources_mutex );
             return -1;
+        }
 
         if ( (n=calloc( 1, sizeof(ipfixt_node_t) )) ==NULL ) {
+            pthread_mutex_unlock( &ipfix_sources_mutex );
             free(t);
             return -1;
         }
 
         if ( (t->fields=calloc( nfields, 
                                 sizeof(ipfix_template_field_t) )) ==NULL ) {
+            pthread_mutex_unlock( &ipfix_sources_mutex );
             free(t);
             free(n);
             return -1;
@@ -744,6 +764,7 @@ int ipfix_decode_trecord( ipfixs_node_t  *s,
     t->nfields = nfields;
     t->ndatafields  = ndatafields;
     t->nscopefields = nscopefields;
+    t->odid = s->odid;
 
     /** read field definitions
      */
@@ -751,6 +772,7 @@ int ipfix_decode_trecord( ipfixs_node_t  *s,
         if ( (offset >= len)
              || (ipfix_read_templ_field( buf+offset, len-offset,
                                          &offset, &(t->fields[i]) ) <0 ) ) {
+            pthread_mutex_unlock( &ipfix_sources_mutex );
             goto errend;
         }
     }    
@@ -771,6 +793,7 @@ int ipfix_decode_trecord( ipfixs_node_t  *s,
     *nread = offset;
     *templ = n;
     errno  = 0;
+    pthread_mutex_unlock( &ipfix_sources_mutex );
     return 0;
 
  errend:
@@ -779,7 +802,9 @@ int ipfix_decode_trecord( ipfixs_node_t  *s,
         free(n);
     }
     else {
+        pthread_mutex_lock( &ipfix_sources_mutex );
         _delete_ipfixt( &(s->templates), n );
+        pthread_mutex_unlock( &ipfix_sources_mutex );
     }
     return -1;
 
@@ -1050,9 +1075,9 @@ int ipfix_parse_msg( ipfix_input_t *input,
              */
             ipfixt_node_t *t;
 
-            if ( (t=_get_ipfixt( s->templates, setid )) ==NULL ) {
-                mlogf( 0, "[%s] no template for %d, skip data set\n", 
-                       func, setid );
+            if ( (t=_get_ipfixt( s->templates, setid, hdr.sourceid )) ==NULL ) {
+                mlogf( 0, "[%s] no template for %d odid %d, skip data set\n", 
+                       func, setid, s->odid );
                 nread += setlen;
                 err_flag = 1;
             } 
@@ -1220,9 +1245,9 @@ int ipfix_parse_raw_msg(ipfixs_node_t *src, ipfixe_node_t  *local_exporter, cons
                 }
             }
 
-            if ( (t=_get_ipfixt( src->templates, setid )) ==NULL ) {
+            if ( (t=_get_ipfixt( src->templates, setid, hdr.sourceid )) ==NULL ) {
                 mlogf( 0, "[%s] no template for %d, skip data set\n",
-                       func, setid );
+                       func, setid, hdr.sourceid );
                 nread += setlen;
                 err_flag = 1;
             }
